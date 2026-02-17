@@ -11,19 +11,23 @@ import streamlit.components.v1 as components
 
 from core.extract_text import extract_text
 from core.tts import tts_to_mp3_file
-from core.stt import stt_mini_transcribe_to_json
+from core.stt import whisper_segments_verbose_json, extract_segments
 
 # ----------------------------
-# Local storage
+# Config
 # ----------------------------
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+TTS_MAX_CHARS = 4096
+
 DATA_DIR = Path.cwd() / "data"
 ITEMS_DIR = DATA_DIR / "items"
 HISTORY_PATH = DATA_DIR / "history.json"
 ITEMS_DIR.mkdir(parents=True, exist_ok=True)
 
-TTS_MAX_CHARS = 4096  # OpenAI Speech max input length :contentReference[oaicite:0]{index=0}
 
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def load_json(path: Path, default):
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
@@ -45,31 +49,17 @@ def save_history(items: list[dict]) -> None:
 
 def now_pt_string() -> str:
     dt = datetime.now(ZoneInfo("America/Los_Angeles"))
-    return dt.strftime("%Y-%m-%d %I:%M %p PT")  # no seconds, AM/PM PT
+    return dt.strftime("%Y-%m-%d %I:%M %p PT")
 
 
-def audio_autoplay(mp3_path: Path, key: str) -> None:
-    if not mp3_path.exists():
-        st.warning("Audio missing.")
-        return
-    b64 = base64.b64encode(mp3_path.read_bytes()).decode("utf-8")
-    components.html(
-        f"""
-        <audio id="peachy" controls autoplay style="width:100%">
-          <source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg" />
-        </audio>
-        <script>
-          const a = document.getElementById("peachy");
-          a.load();
-          a.play().catch(()=>{{}});
-        </script>
-        """,
-        height=70,
-        key=key,
-    )
+def fmt_mmss(seconds: float) -> str:
+    s = int(max(0, seconds))
+    m = s // 60
+    ss = s % 60
+    return f"{m}:{ss:02d}"
 
 
-def scroll_box(text: str, height_px: int = 360) -> None:
+def scroll_box(text: str, height_px: int) -> None:
     safe = (
         (text or "")
         .replace("&", "&amp;")
@@ -96,46 +86,96 @@ def scroll_box(text: str, height_px: int = 360) -> None:
     )
 
 
+def audio_player_seek(mp3_path: Path, seek_to: float, marker: str) -> None:
+    """
+    Reliable seek+play: render in an iframe (components.html) so the script always runs.
+    `marker` should change when selection/seek changes to force a fresh DOM id.
+    """
+    if not mp3_path.exists():
+        st.warning("Audio missing.")
+        return
+
+    b64 = base64.b64encode(mp3_path.read_bytes()).decode("utf-8")
+    dom_id = f"peachy_{marker}_{uuid.uuid4().hex}"
+    seek = float(seek_to or 0.0)
+
+    components.html(
+        f"""
+        <div style="width:100%;">
+          <audio id="{dom_id}" controls style="width:100%;">
+            <source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg" />
+          </audio>
+        </div>
+        <script>
+          (function() {{
+            const a = document.getElementById("{dom_id}");
+            const seekTo = {seek};
+
+            const start = () => {{
+              try {{
+                a.currentTime = Math.max(0, seekTo);
+              }} catch(e) {{}}
+              a.play().catch(()=>{{}});
+            }};
+
+            if (a.readyState >= 1) {{
+              start();
+            }} else {{
+              a.addEventListener("loadedmetadata", start, {{ once: true }});
+              a.load();
+            }}
+          }})();
+        </script>
+        """,
+        height=90,
+    )
+
+
 # ----------------------------
-# App
+# App state
 # ----------------------------
 st.set_page_config(page_title="Peachy", layout="centered")
-st.title("Peachy 🍑")
 
 history = load_history()
 history_sorted = sorted(history, key=lambda x: x["created_at"], reverse=True)
 ids = [x["id"] for x in history_sorted]
 
-# session state
 if "mode" not in st.session_state:
     st.session_state.mode = "playback"  # "new" | "playback"
 if "selected_id" not in st.session_state:
     st.session_state.selected_id = None
 if "pending_doc" not in st.session_state:
     st.session_state.pending_doc = None
-if "force_history_select" not in st.session_state:
-    st.session_state.force_history_select = None
+if "force_select_id" not in st.session_state:
+    st.session_state.force_select_id = None
+if "seek_to" not in st.session_state:
+    st.session_state.seek_to = 0.0
+if "seek_nonce" not in st.session_state:
+    st.session_state.seek_nonce = 0
 
-# default selection (BEFORE widgets)
+# Defaults BEFORE widgets
 if ids and st.session_state.selected_id is None:
     st.session_state.selected_id = ids[0]
 
 if "history_select" not in st.session_state and st.session_state.selected_id:
     st.session_state.history_select = st.session_state.selected_id
 
-# if we just generated a new item, sync the dropdown on the next run (before widget)
-if st.session_state.force_history_select and st.session_state.force_history_select in ids:
-    st.session_state.history_select = st.session_state.force_history_select
-    st.session_state.force_history_select = None
+if st.session_state.force_select_id and st.session_state.force_select_id in ids:
+    st.session_state.history_select = st.session_state.force_select_id
+    st.session_state.force_select_id = None
 
 
 # ----------------------------
 # Sidebar
 # ----------------------------
 with st.sidebar:
+    st.title("Peachy 🍑")
+
     if st.button("New Peachy", use_container_width=True):
         st.session_state.mode = "new"
         st.session_state.pending_doc = None
+        st.session_state.seek_to = 0.0
+        st.session_state.seek_nonce += 1
         st.rerun()
 
     st.divider()
@@ -153,6 +193,8 @@ with st.sidebar:
         if picked != st.session_state.selected_id:
             st.session_state.selected_id = picked
             st.session_state.mode = "playback"
+            st.session_state.seek_to = 0.0
+            st.session_state.seek_nonce += 1
             st.rerun()
 
 
@@ -162,28 +204,34 @@ with st.sidebar:
 if st.session_state.mode == "new":
     st.subheader("Create a new Peachy :)")
 
-    voice = st.selectbox(
-        "Voice",
-        ["marin", "cedar", "alloy", "nova", "coral", "sage", "shimmer", "verse", "ash", "ballad", "echo", "fable", "onyx"],
-        index=0,
-        key="new_voice",
-    )
+    voice = st.selectbox("Voice", ["marin", "cedar", "alloy", "nova"], index=0, key="new_voice")
     speed = st.slider("Speed", 0.70, 1.30, 1.00, 0.05, key="new_speed")
 
-    up = st.file_uploader("Upload .txt / .docx / .pdf", type=["txt", "docx", "pdf"], key="new_upload_main")
+    up = st.file_uploader(
+        "Upload .txt / .docx / .pdf (max 10 MB)",
+        type=["txt", "docx", "pdf"],
+        key="new_upload_main",
+    )
 
+    st.session_state.pending_doc = None
     if up:
+        # enforce 10MB
+        size = getattr(up, "size", None)
         raw = up.read()
-        text = extract_text(up.name, raw).strip()  # preview immediately (no OpenAI)
-        st.session_state.pending_doc = {"title": up.name, "text": text}
-    else:
-        st.session_state.pending_doc = None
+        if size is None:
+            size = len(raw)
+
+        if size > MAX_UPLOAD_BYTES:
+            st.error("File too large. Max is 10 MB.")
+        else:
+            text = extract_text(up.name, raw).strip()  # preview immediately (no OpenAI)
+            st.session_state.pending_doc = {"title": up.name, "text": text}
 
     if st.session_state.pending_doc:
         st.caption(f'Preview: {st.session_state.pending_doc["title"]}')
-        scroll_box(st.session_state.pending_doc["text"], height_px=360)
+        scroll_box(st.session_state.pending_doc["text"], height_px=180)  # smaller preview
 
-        if st.button("Generate audio", use_container_width=True):
+        if st.button("Generate audio + timestamped transcript", use_container_width=True):
             item_id = uuid.uuid4().hex
             created_at = now_pt_string()
 
@@ -193,20 +241,32 @@ if st.session_state.mode == "new":
             title = st.session_state.pending_doc["title"]
             full_text = st.session_state.pending_doc["text"]
 
-            # Save extracted text (not the original upload)
             (item_dir / "full.txt").write_text(full_text, encoding="utf-8")
 
-            # 1) TTS (single call, max 4096 chars)
             audio_path = item_dir / "audio.mp3"
-            tts_input = full_text[:TTS_MAX_CHARS]
-            tts_to_mp3_file(tts_input, str(audio_path), voice=voice, speed=speed)
+            segments_path = item_dir / "segments.json"
+            stt_verbose_path = item_dir / "stt_verbose.json"
 
-            # 2) STT mini (transcribe the generated audio)
-            # Note: gpt-4o-mini-transcribe is the STT mini model :contentReference[oaicite:1]{index=1}
-            with st.spinner("Creating transcript…"):
-                stt_json = stt_mini_transcribe_to_json(str(audio_path))
-                save_json(item_dir / "stt.json", stt_json)
-                (item_dir / "stt.txt").write_text(stt_json.get("text", ""), encoding="utf-8")
+            status = st.status("Working…", expanded=True)
+
+            try:
+                status.write("Step 1/2: Generating audio…")
+                tts_to_mp3_file(full_text[:TTS_MAX_CHARS], str(audio_path), voice=voice, speed=speed)
+                status.write("✅ Audio generated")
+
+                status.write("Step 2/2: Transcribing with Whisper (segments)…")
+                stt_verbose = whisper_segments_verbose_json(str(audio_path))
+                segments = extract_segments(stt_verbose)
+                save_json(stt_verbose_path, stt_verbose)
+                save_json(segments_path, segments)
+                status.write("✅ Transcript created")
+
+                status.update(label="Done", state="complete", expanded=False)
+
+            except Exception as e:
+                status.update(label="Failed", state="error", expanded=True)
+                st.exception(e)
+                st.stop()
 
             history.append(
                 {
@@ -221,11 +281,12 @@ if st.session_state.mode == "new":
             save_history(history)
 
             st.session_state.selected_id = item_id
-            st.session_state.force_history_select = item_id
+            st.session_state.force_select_id = item_id
             st.session_state.mode = "playback"
             st.session_state.pending_doc = None
+            st.session_state.seek_to = 0.0
+            st.session_state.seek_nonce += 1
             st.rerun()
-
     else:
         st.caption("Upload a file to see a preview, then generate audio.")
 
@@ -243,8 +304,8 @@ else:
         else:
             item_dir = Path(selected["item_dir"])
             audio_path = item_dir / "audio.mp3"
-            text_path = item_dir / "full.txt"
-            stt_path = item_dir / "stt.txt"
+            segments = load_json(item_dir / "segments.json", [])
+            full_text_path = item_dir / "full.txt"
 
             st.subheader("Playback")
             st.write(
@@ -254,12 +315,28 @@ else:
                 f'**Created:** {selected["created_at"]}'
             )
 
-            audio_autoplay(audio_path, key=f"player_{selected['id']}")
+            # This is the only widget that can reliably seek-to-time in Streamlit.
+            # st.audio cannot be programmatically seeked.
+            audio_player_seek(
+                audio_path,
+                seek_to=st.session_state.seek_to,
+                marker=f"{selected['id']}_{st.session_state.seek_nonce}",
+            )
 
-            if text_path.exists():
-                st.markdown("#### Extracted text")
-                scroll_box(text_path.read_text(encoding="utf-8", errors="ignore"), height_px=420)
+            st.markdown("### Transcript (tap to jump)")
+            if not segments:
+                st.caption("No segments found.")
+            else:
+                for i, seg in enumerate(segments):
+                    start = float(seg.get("start", 0.0))
+                    txt = (seg.get("text") or "").strip()
+                    label = f"{fmt_mmss(start)}  {txt}"
 
-            if stt_path.exists():
-                with st.expander("Transcript (STT mini)"):
-                    st.write(stt_path.read_text(encoding="utf-8", errors="ignore"))
+                    if st.button(label, key=f"seg_{selected['id']}_{i}", use_container_width=True):
+                        st.session_state.seek_to = start
+                        st.session_state.seek_nonce += 1
+                        st.rerun()
+
+            if full_text_path.exists():
+                with st.expander("Extracted text"):
+                    scroll_box(full_text_path.read_text(encoding="utf-8", errors="ignore"), height_px=360)

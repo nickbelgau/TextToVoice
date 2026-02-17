@@ -7,7 +7,7 @@ client = OpenAI(api_key=key)
 def tts_to_mp3_file(
     text: str,
     out_path: str,
-    voice: str = "marin",
+    voice: str = "nova",
     speed: float = 1.0,
     model: str = "gpt-4o-mini-tts",
 ) -> Path:
