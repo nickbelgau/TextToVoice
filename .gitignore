@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.DS_Store
+.streamlit/secrets.toml
+*.mp3
+*.wav
