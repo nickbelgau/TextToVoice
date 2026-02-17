@@ -1,22 +1,27 @@
+# app.py
+import base64
 import json
-import re
-import time
 import uuid
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from core.extract_text import extract_text
 from core.tts import tts_to_mp3_file
+from core.stt import stt_mini_transcribe_to_json
 
 # ----------------------------
-# Storage (local)
+# Local storage
 # ----------------------------
 DATA_DIR = Path.cwd() / "data"
 ITEMS_DIR = DATA_DIR / "items"
 HISTORY_PATH = DATA_DIR / "history.json"
-
 ITEMS_DIR.mkdir(parents=True, exist_ok=True)
+
+TTS_MAX_CHARS = 4096  # OpenAI Speech max input length :contentReference[oaicite:0]{index=0}
 
 
 def load_json(path: Path, default):
@@ -38,216 +43,223 @@ def save_history(items: list[dict]) -> None:
     save_json(HISTORY_PATH, items)
 
 
-# ----------------------------
-# Chunking (simple + readable)
-# ----------------------------
-def chunk_text(text: str, target_chars: int = 900) -> list[str]:
-    """
-    Chunk by paragraphs; if a paragraph is too long, split by sentences,
-    falling back to hard splits. Keeps chunks comfortably under the 4096 limit.
-    """
-    t = (text or "").strip()
-    if not t:
-        return []
-
-    # Normalize whitespace a bit
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
-    t = re.sub(r"\n{3,}", "\n\n", t)
-
-    paras = [p.strip() for p in t.split("\n\n") if p.strip()]
-    chunks: list[str] = []
-
-    for p in paras:
-        if len(p) <= target_chars:
-            chunks.append(p)
-            continue
-
-        # sentence split
-        sentences = re.split(r"(?<=[.!?])\s+", p)
-        cur = ""
-        for s in sentences:
-            s = s.strip()
-            if not s:
-                continue
-            if len(cur) + len(s) + 1 <= target_chars:
-                cur = (cur + " " + s).strip()
-            else:
-                if cur:
-                    chunks.append(cur)
-                cur = s
-
-        if cur:
-            chunks.append(cur)
-
-    # Hard cap any weird huge chunk
-    final: list[str] = []
-    for c in chunks:
-        c = c.strip()
-        if len(c) <= 1200:
-            final.append(c)
-        else:
-            for i in range(0, len(c), 1200):
-                final.append(c[i : i + 1200].strip())
-
-    return [c for c in final if c]
+def now_pt_string() -> str:
+    dt = datetime.now(ZoneInfo("America/Los_Angeles"))
+    return dt.strftime("%Y-%m-%d %I:%M %p PT")  # no seconds, AM/PM PT
 
 
-def render_followalong(chunks: list[str], current_idx: int) -> None:
-    # Compact scroll box + highlight current chunk
-    html_parts = [
-        """
+def audio_autoplay(mp3_path: Path, key: str) -> None:
+    if not mp3_path.exists():
+        st.warning("Audio missing.")
+        return
+    b64 = base64.b64encode(mp3_path.read_bytes()).decode("utf-8")
+    components.html(
+        f"""
+        <audio id="peachy" controls autoplay style="width:100%">
+          <source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg" />
+        </audio>
+        <script>
+          const a = document.getElementById("peachy");
+          a.load();
+          a.play().catch(()=>{{}});
+        </script>
+        """,
+        height=70,
+        key=key,
+    )
+
+
+def scroll_box(text: str, height_px: int = 360) -> None:
+    safe = (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br>")
+    )
+    st.markdown(
+        f"""
         <style>
-          .box { height: 320px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; border-radius: 8px; }
-          .p { margin: 0 0 10px 0; padding: 6px 8px; border-radius: 6px; }
-          .cur { background: rgba(255, 235, 59, 0.35); border: 1px solid rgba(255, 235, 59, 0.7); }
-          .idx { opacity: 0.55; font-size: 12px; margin-right: 6px; }
+          .box {{
+            height: {height_px}px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 12px;
+            border-radius: 12px;
+            line-height: 1.35;
+            font-size: 16px;
+          }}
         </style>
-        <div class="box">
-        """
-    ]
-
-    for i, c in enumerate(chunks):
-        cls = "p cur" if i == current_idx else "p"
-        safe = (
-            c.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
-        html_parts.append(f'<div class="{cls}"><span class="idx">{i+1}.</span>{safe}</div>')
-
-    html_parts.append("</div>")
-    st.markdown("".join(html_parts), unsafe_allow_html=True)
+        <div class="box">{safe}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ----------------------------
-# Streamlit App
+# App
 # ----------------------------
-st.set_page_config(page_title="TextToVoice", layout="centered")
-st.title("TextToVoice")
+st.set_page_config(page_title="Peachy", layout="centered")
+st.title("Peachy 🍑")
 
 history = load_history()
 history_sorted = sorted(history, key=lambda x: x["created_at"], reverse=True)
+ids = [x["id"] for x in history_sorted]
 
-# Session state
+# session state
+if "mode" not in st.session_state:
+    st.session_state.mode = "playback"  # "new" | "playback"
 if "selected_id" not in st.session_state:
     st.session_state.selected_id = None
-if "chunk_idx" not in st.session_state:
-    st.session_state.chunk_idx = 0
+if "pending_doc" not in st.session_state:
+    st.session_state.pending_doc = None
+if "force_history_select" not in st.session_state:
+    st.session_state.force_history_select = None
 
-# Sidebar: pick history item
-st.sidebar.header("History")
-if history_sorted:
-    ids = [x["id"] for x in history_sorted]
+# default selection (BEFORE widgets)
+if ids and st.session_state.selected_id is None:
+    st.session_state.selected_id = ids[0]
 
-    def fmt(item_id: str) -> str:
-        it = next(x for x in history_sorted if x["id"] == item_id)
-        return f'{it["created_at"]} — {it["title"]} ({it["voice"]})'
+if "history_select" not in st.session_state and st.session_state.selected_id:
+    st.session_state.history_select = st.session_state.selected_id
 
-    picked = st.sidebar.selectbox("Select", ids, format_func=fmt)
-    if picked != st.session_state.selected_id:
-        st.session_state.selected_id = picked
-        st.session_state.chunk_idx = 0
-else:
-    st.sidebar.caption("No history yet.")
+# if we just generated a new item, sync the dropdown on the next run (before widget)
+if st.session_state.force_history_select and st.session_state.force_history_select in ids:
+    st.session_state.history_select = st.session_state.force_history_select
+    st.session_state.force_history_select = None
 
-# Load selected item (if any)
-selected = None
-chunks = []
-audio_dir = None
-if st.session_state.selected_id:
-    selected = next((x for x in history_sorted if x["id"] == st.session_state.selected_id), None)
-    if selected:
-        item_dir = Path(selected["item_dir"])
-        chunks = load_json(item_dir / "chunks.json", [])
-        audio_dir = item_dir / "audio"
 
-# Main: show selected + follow-along + controls
-if selected:
-    st.subheader("Follow along")
-    st.write(f'**Title:** {selected["title"]}  |  **Voice:** {selected["voice"]}  |  **Chunks:** {selected["chunk_count"]}')
-
-    if chunks:
-        # clamp index
-        st.session_state.chunk_idx = max(0, min(st.session_state.chunk_idx, len(chunks) - 1))
-        render_followalong(chunks, st.session_state.chunk_idx)
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("Prev", use_container_width=True):
-                st.session_state.chunk_idx = max(0, st.session_state.chunk_idx - 1)
-                st.rerun()
-        with col2:
-            if st.button("Play chunk", use_container_width=True):
-                pass  # audio render below
-        with col3:
-            if st.button("Next", use_container_width=True):
-                st.session_state.chunk_idx = min(len(chunks) - 1, st.session_state.chunk_idx + 1)
-                st.rerun()
-
-        # Always show the current chunk audio player (so "Play" works reliably)
-        cur_mp3 = audio_dir / f"chunk_{st.session_state.chunk_idx:03d}.mp3"
-        if cur_mp3.exists():
-            st.audio(str(cur_mp3), format="audio/mp3")
-        else:
-            st.warning("Audio for this chunk is missing. (Regenerate from upload or add on-demand generation.)")
-
-        st.caption("Tip: audio won’t auto-advance to the next chunk yet (manual Next).")
-    else:
-        st.warning("No chunks found for this history item.")
-
-st.divider()
-
-# Upload + generate new item
-st.subheader("New document")
-voice = st.selectbox("Voice", ["marin", "cedar", "alloy", "nova"], index=0)
-f = st.file_uploader("Upload a .txt, .docx, or .pdf", type=["txt", "docx", "pdf"])
-
-if f:
-    raw = f.read()  # not persisted
-    text = extract_text(f.name, raw).strip()
-
-    # chunk + show compact
-    new_chunks = chunk_text(text, target_chars=900)
-    st.write(f"Chunks: **{len(new_chunks)}**")
-    if new_chunks:
-        render_followalong(new_chunks, 0)
-
-    if st.button("Save + Generate audio"):
-        item_id = uuid.uuid4().hex
-        created_at = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        item_dir = ITEMS_DIR / item_id
-        audio_dir = item_dir / "audio"
-        audio_dir.mkdir(parents=True, exist_ok=True)
-
-        # persist extracted text + chunks (not original file)
-        (item_dir / "full.txt").write_text(text, encoding="utf-8")
-        save_json(item_dir / "chunks.json", new_chunks)
-
-        # generate mp3 per chunk
-        prog = st.progress(0)
-        total = max(1, len(new_chunks))
-        for i, c in enumerate(new_chunks):
-            mp3_path = audio_dir / f"chunk_{i:03d}.mp3"
-            # keep safely under limit for now
-            tts_to_mp3_file(c[:4000], str(mp3_path), voice=voice)
-            prog.progress(int(((i + 1) / total) * 100))
-
-        # update history index
-        history.append(
-            {
-                "id": item_id,
-                "created_at": created_at,
-                "title": f.name,  # document title = filename for now
-                "voice": voice,
-                "chunk_count": len(new_chunks),
-                "item_dir": str(item_dir),
-            }
-        )
-        save_history(history)
-
-        # select the new item
-        st.session_state.selected_id = item_id
-        st.session_state.chunk_idx = 0
+# ----------------------------
+# Sidebar
+# ----------------------------
+with st.sidebar:
+    if st.button("New Peachy", use_container_width=True):
+        st.session_state.mode = "new"
+        st.session_state.pending_doc = None
         st.rerun()
+
+    st.divider()
+    st.header("History")
+
+    if not ids:
+        st.caption("No history yet.")
+    else:
+        def fmt(item_id: str) -> str:
+            it = next(x for x in history_sorted if x["id"] == item_id)
+            return f'{it["created_at"]} — {it["title"]}'
+
+        picked = st.selectbox("Select", ids, format_func=fmt, key="history_select")
+
+        if picked != st.session_state.selected_id:
+            st.session_state.selected_id = picked
+            st.session_state.mode = "playback"
+            st.rerun()
+
+
+# ----------------------------
+# Main: New view
+# ----------------------------
+if st.session_state.mode == "new":
+    st.subheader("Create a new Peachy :)")
+
+    voice = st.selectbox(
+        "Voice",
+        ["marin", "cedar", "alloy", "nova", "coral", "sage", "shimmer", "verse", "ash", "ballad", "echo", "fable", "onyx"],
+        index=0,
+        key="new_voice",
+    )
+    speed = st.slider("Speed", 0.70, 1.30, 1.00, 0.05, key="new_speed")
+
+    up = st.file_uploader("Upload .txt / .docx / .pdf", type=["txt", "docx", "pdf"], key="new_upload_main")
+
+    if up:
+        raw = up.read()
+        text = extract_text(up.name, raw).strip()  # preview immediately (no OpenAI)
+        st.session_state.pending_doc = {"title": up.name, "text": text}
+    else:
+        st.session_state.pending_doc = None
+
+    if st.session_state.pending_doc:
+        st.caption(f'Preview: {st.session_state.pending_doc["title"]}')
+        scroll_box(st.session_state.pending_doc["text"], height_px=360)
+
+        if st.button("Generate audio", use_container_width=True):
+            item_id = uuid.uuid4().hex
+            created_at = now_pt_string()
+
+            item_dir = ITEMS_DIR / item_id
+            item_dir.mkdir(parents=True, exist_ok=True)
+
+            title = st.session_state.pending_doc["title"]
+            full_text = st.session_state.pending_doc["text"]
+
+            # Save extracted text (not the original upload)
+            (item_dir / "full.txt").write_text(full_text, encoding="utf-8")
+
+            # 1) TTS (single call, max 4096 chars)
+            audio_path = item_dir / "audio.mp3"
+            tts_input = full_text[:TTS_MAX_CHARS]
+            tts_to_mp3_file(tts_input, str(audio_path), voice=voice, speed=speed)
+
+            # 2) STT mini (transcribe the generated audio)
+            # Note: gpt-4o-mini-transcribe is the STT mini model :contentReference[oaicite:1]{index=1}
+            with st.spinner("Creating transcript…"):
+                stt_json = stt_mini_transcribe_to_json(str(audio_path))
+                save_json(item_dir / "stt.json", stt_json)
+                (item_dir / "stt.txt").write_text(stt_json.get("text", ""), encoding="utf-8")
+
+            history.append(
+                {
+                    "id": item_id,
+                    "created_at": created_at,
+                    "title": title,
+                    "voice": voice,
+                    "speed": speed,
+                    "item_dir": str(item_dir),
+                }
+            )
+            save_history(history)
+
+            st.session_state.selected_id = item_id
+            st.session_state.force_history_select = item_id
+            st.session_state.mode = "playback"
+            st.session_state.pending_doc = None
+            st.rerun()
+
+    else:
+        st.caption("Upload a file to see a preview, then generate audio.")
+
+
+# ----------------------------
+# Main: Playback view
+# ----------------------------
+else:
+    if not ids:
+        st.subheader("Create a new Peachy :)")
+    else:
+        selected = next((x for x in history_sorted if x["id"] == st.session_state.selected_id), None)
+        if not selected:
+            st.subheader("Create a new Peachy :)")
+        else:
+            item_dir = Path(selected["item_dir"])
+            audio_path = item_dir / "audio.mp3"
+            text_path = item_dir / "full.txt"
+            stt_path = item_dir / "stt.txt"
+
+            st.subheader("Playback")
+            st.write(
+                f'**Title:** {selected["title"]}  |  '
+                f'**Voice:** {selected.get("voice","")}  |  '
+                f'**Speed:** {selected.get("speed", 1.0)}  |  '
+                f'**Created:** {selected["created_at"]}'
+            )
+
+            audio_autoplay(audio_path, key=f"player_{selected['id']}")
+
+            if text_path.exists():
+                st.markdown("#### Extracted text")
+                scroll_box(text_path.read_text(encoding="utf-8", errors="ignore"), height_px=420)
+
+            if stt_path.exists():
+                with st.expander("Transcript (STT mini)"):
+                    st.write(stt_path.read_text(encoding="utf-8", errors="ignore"))
