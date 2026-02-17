@@ -1,3 +1,0 @@
-
-import openai
-key = ''

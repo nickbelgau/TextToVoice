@@ -1,10 +1,9 @@
 from pathlib import Path
 from openai import OpenAI
 
-key = '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'
-client = OpenAI(api_key=key)
+client = OpenAI()
 
-def tts_to_mp3_file(text: str, out_path: str, voice: str = "nova") -> Path:
+def tts_to_mp3_file(text: str, out_path: str, voice: str = "marin", speed: float = 1.0) -> Path:
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -12,8 +11,10 @@ def tts_to_mp3_file(text: str, out_path: str, voice: str = "nova") -> Path:
         model="gpt-4o-mini-tts",
         voice=voice,
         input=text,
-        instructions="Read naturally.",
+        speed=speed,
+        instructions="Read naturally, like a helpful assistant.",
         response_format="mp3",
     ) as response:
         response.stream_to_file(out)
+
     return out
