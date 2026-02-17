@@ -5,10 +5,9 @@ key = 'sk-proj-b7C6z2Ppaxwa81YD4KMrNakvDzvakcldh9XkfJX2jDQ1wyuCGhU3caVFV8HUq8Ndo
 client = OpenAI(api_key=key)
 
 DEFAULT_INSTRUCTIONS = (
-    "Speak like a calm, confident interview coach. "
+    "Speak like a calm, confident interviewer. "
     "Use a steady pace and short, clear sentences. "
     "Pause briefly between ideas. "
-    "Sound encouraging but direct. "
     "When reading Q&A prep, emphasize key phrases and outcomes. "
     "Do not sound robotic."
 )
