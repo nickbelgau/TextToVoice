@@ -49,7 +49,8 @@ def save_history(items: list[dict]) -> None:
 
 def now_pt_string() -> str:
     dt = datetime.now(ZoneInfo("America/Los_Angeles"))
-    return dt.strftime("%Y-%m-%d %I:%M %p PT")
+    # removed "PT"
+    return dt.strftime("%Y-%m-%d %I:%M %p")
 
 
 def fmt_mmss(seconds: float) -> str:
@@ -87,10 +88,6 @@ def scroll_box(text: str, height_px: int) -> None:
 
 
 def audio_player_seek(mp3_path: Path, seek_to: float, marker: str) -> None:
-    """
-    Reliable seek+play: render in an iframe (components.html) so the script always runs.
-    `marker` should change when selection/seek changes to force a fresh DOM id.
-    """
     if not mp3_path.exists():
         st.warning("Audio missing.")
         return
@@ -112,9 +109,7 @@ def audio_player_seek(mp3_path: Path, seek_to: float, marker: str) -> None:
             const seekTo = {seek};
 
             const start = () => {{
-              try {{
-                a.currentTime = Math.max(0, seekTo);
-              }} catch(e) {{}}
+              try {{ a.currentTime = Math.max(0, seekTo); }} catch(e) {{}}
               a.play().catch(()=>{{}});
             }};
 
@@ -129,6 +124,23 @@ def audio_player_seek(mp3_path: Path, seek_to: float, marker: str) -> None:
         """,
         height=90,
     )
+
+
+def brief_preview(text: str, max_chars: int = 600) -> str:
+    """
+    Show just a paragraph-ish preview (not the whole thing).
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # prefer first paragraph
+    parts = [p.strip() for p in t.split("\n\n") if p.strip()]
+    if parts:
+        p0 = parts[0]
+        if len(p0) <= max_chars:
+            return p0
+        return p0[:max_chars].rstrip() + "…"
+    return (t[:max_chars].rstrip() + "…") if len(t) > max_chars else t
 
 
 # ----------------------------
@@ -204,7 +216,19 @@ with st.sidebar:
 if st.session_state.mode == "new":
     st.subheader("Create a new Peachy :)")
 
-    voice = st.selectbox("Voice", ["marin", "cedar", "alloy", "nova"], index=0, key="new_voice")
+    # Prompt / instructions recommendation (calming + firm)
+    st.markdown("**Suggested instructions (calming, firm interview coach):**")
+    st.code(
+        "Speak like a calm, confident interview coach. "
+        "Use a steady pace and short, clear sentences. "
+        "Pause briefly between ideas. "
+        "Sound encouraging but direct. "
+        "When reading Q&A prep, emphasize key phrases and outcomes. "
+        "Do not sound robotic."
+    )
+
+    # Default voice = nova
+    voice = st.selectbox("Voice", ["nova", "marin", "cedar", "alloy"], index=0, key="new_voice")
     speed = st.slider("Speed", 0.70, 1.30, 1.00, 0.05, key="new_speed")
 
     up = st.file_uploader(
@@ -215,7 +239,6 @@ if st.session_state.mode == "new":
 
     st.session_state.pending_doc = None
     if up:
-        # enforce 10MB
         size = getattr(up, "size", None)
         raw = up.read()
         if size is None:
@@ -224,14 +247,15 @@ if st.session_state.mode == "new":
         if size > MAX_UPLOAD_BYTES:
             st.error("File too large. Max is 10 MB.")
         else:
-            text = extract_text(up.name, raw).strip()  # preview immediately (no OpenAI)
+            text = extract_text(up.name, raw).strip()
             st.session_state.pending_doc = {"title": up.name, "text": text}
 
     if st.session_state.pending_doc:
         st.caption(f'Preview: {st.session_state.pending_doc["title"]}')
-        scroll_box(st.session_state.pending_doc["text"], height_px=180)  # smaller preview
+        # brief preview only
+        scroll_box(brief_preview(st.session_state.pending_doc["text"], max_chars=700), height_px=150)
 
-        if st.button("Generate audio + timestamped transcript", use_container_width=True):
+        if st.button("Generate this mama jamma", use_container_width=True):
             item_id = uuid.uuid4().hex
             created_at = now_pt_string()
 
@@ -251,6 +275,7 @@ if st.session_state.mode == "new":
 
             try:
                 status.write("Step 1/2: Generating audio…")
+                # NOTE: instructions are handled inside core/tts.py now (see below)
                 tts_to_mp3_file(full_text[:TTS_MAX_CHARS], str(audio_path), voice=voice, speed=speed)
                 status.write("✅ Audio generated")
 
@@ -315,8 +340,6 @@ else:
                 f'**Created:** {selected["created_at"]}'
             )
 
-            # This is the only widget that can reliably seek-to-time in Streamlit.
-            # st.audio cannot be programmatically seeked.
             audio_player_seek(
                 audio_path,
                 seek_to=st.session_state.seek_to,
