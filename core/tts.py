@@ -1,8 +1,8 @@
 from pathlib import Path
 from openai import OpenAI
+import streamlit as st
 
-key = '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'
-client = OpenAI(api_key=key)
+client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
 DEFAULT_INSTRUCTIONS = (
     "Speak like a calm, confident interviewer. "
