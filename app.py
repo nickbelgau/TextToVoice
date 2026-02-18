@@ -2,6 +2,7 @@
 import base64
 import json
 import uuid
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -12,6 +13,7 @@ import streamlit.components.v1 as components
 from core.extract_text import extract_text
 from core.tts import tts_to_mp3_file
 from core.stt import whisper_segments_verbose_json, extract_segments, merge_segments
+from core.storage import LocalStorage, B2Storage, Storage
 
 # ----------------------------
 # Config
@@ -23,44 +25,52 @@ PREVIEW_MAX_CHARS = 1200
 PREVIEW_HEIGHT_PX = 160
 
 DATA_DIR = Path.cwd() / "data"
-ITEMS_DIR = DATA_DIR / "items"
-HISTORY_PATH = DATA_DIR / "history.json"
-ITEMS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+HISTORY_KEY = "history.json"
 
 VOICES = ["cedar", "nova", "alloy", "marin"]
 VOICE_PREVIEW_TEXT = "Hi! I'm Peachy. This is a quick preview of the voice you're about to choose."
-VOICE_PREVIEW_DIR = DATA_DIR / "voice_previews"
-VOICE_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
 DISPLAY_SEG_MAX_SECONDS = 10.0
 DISPLAY_SEG_MAX_CHARS = 520
 
 
 # ----------------------------
+# Storage selection (local vs B2)
+# ----------------------------
+def get_storage() -> Storage:
+    backend = (st.secrets.get("STORAGE_BACKEND") or "local").lower()
+
+    if backend == "b2":
+        return B2Storage(
+            endpoint_url=st.secrets["B2_S3_ENDPOINT"],
+            bucket=st.secrets["B2_BUCKET"],
+            access_key_id=st.secrets["B2_ACCESS_KEY_ID"],
+            secret_access_key=st.secrets["B2_SECRET_APPL_KEY"],
+            prefix=st.secrets.get("B2_PREFIX", ""),  # optional
+        )
+
+    return LocalStorage(root=DATA_DIR)
+
+
+storage = get_storage()
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
-def load_json(path: Path, default):
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return default
-
-
-def save_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
-
-
 def load_history() -> list[dict]:
-    return load_json(HISTORY_PATH, [])
+    return storage.read_json(HISTORY_KEY, [])
 
 
 def save_history(items: list[dict]) -> None:
-    save_json(HISTORY_PATH, items)
+    storage.write_json(HISTORY_KEY, items)
 
 
 def now_pt_string() -> str:
     dt = datetime.now(ZoneInfo("America/Los_Angeles"))
-    return dt.strftime("%Y-%m-%d %I:%M %p")  # PT removed
+    return dt.strftime("%Y-%m-%d %I:%M %p")
 
 
 def fmt_mmss(seconds: float) -> str:
@@ -116,25 +126,32 @@ def make_preview(text: str, max_chars: int = PREVIEW_MAX_CHARS) -> str:
     return shown + marker
 
 
-@st.cache_data(show_spinner=False)
 def voice_preview_bytes(voice: str, speed: float) -> bytes:
     speed_key = f"{float(speed):.2f}".replace(".", "_")
-    out = VOICE_PREVIEW_DIR / f"{voice}_s{speed_key}.mp3"
-    if not out.exists():
+    key = f"voice_previews/{voice}_s{speed_key}.mp3"
+
+    if storage.exists(key):
+        return storage.read_bytes(key)
+
+    # generate locally, then upload to chosen storage
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "preview.mp3"
         tts_to_mp3_file(VOICE_PREVIEW_TEXT, str(out), voice=voice, speed=float(speed))
-    return out.read_bytes()
+        b = out.read_bytes()
+        storage.write_bytes(key, b, content_type="audio/mpeg")
+        return b
 
 
-def audio_player(mp3_path: Path, seek_to: float, should_play: bool, marker: str) -> None:
+def audio_player_bytes(mp3_bytes: bytes, seek_to: float, should_play: bool, marker: str) -> None:
     """
-    Does NOT autoplay on initial render or history change.
-    Only seeks+plays when should_play=True (i.e., user clicked a timestamp).
+    No autoplay on initial render/history change.
+    Only seeks+plays when should_play=True (user clicked a timestamp).
     """
-    if not mp3_path.exists():
+    if not mp3_bytes:
         st.warning("Audio missing.")
         return
 
-    b64 = base64.b64encode(mp3_path.read_bytes()).decode("utf-8")
+    b64 = base64.b64encode(mp3_bytes).decode("utf-8")
     dom_id = f"peachy_{marker}_{uuid.uuid4().hex}"
     seek = float(seek_to or 0.0)
     play_flag = "true" if should_play else "false"
@@ -217,12 +234,11 @@ if st.session_state.force_select_id and st.session_state.force_select_id in ids:
 # Sidebar
 # ----------------------------
 with st.sidebar:
-    # darker / less bright button styling (scoped to sidebar primary buttons)
     st.markdown(
         """
         <style>
           section[data-testid="stSidebar"] button[data-testid="baseButton-primary"]{
-            background-color: #b75b55 !important;  /* muted brick-peach */
+            background-color: #b75b55 !important;
             border-color: #b75b55 !important;
             color: #ffffff !important;
             font-size: 1.05rem !important;
@@ -276,7 +292,6 @@ with st.sidebar:
 if st.session_state.mode == "new":
     st.subheader("Create a new Peachy :)")
 
-    # narrower speed slider
     c_speed, _ = st.columns([2, 5])
     with c_speed:
         speed = st.slider("Speed", 0.70, 1.30, float(st.session_state.get("new_speed", 1.00)), 0.05, key="new_speed")
@@ -291,7 +306,7 @@ if st.session_state.mode == "new":
     )
     st.session_state.new_voice = voice
 
-    # single preview (changes with voice + speed)
+    # preview stored in the same storage backend (local or B2)
     st.audio(voice_preview_bytes(voice, speed), format="audio/mp3")
 
     up = st.file_uploader(
@@ -321,31 +336,38 @@ if st.session_state.mode == "new":
             item_id = uuid.uuid4().hex
             created_at = now_pt_string()
 
-            item_dir = ITEMS_DIR / item_id
-            item_dir.mkdir(parents=True, exist_ok=True)
-
             title = st.session_state.pending_doc["title"]
             full_text = st.session_state.pending_doc["text"]
 
-            (item_dir / "full.txt").write_text(full_text, encoding="utf-8")
+            item_prefix = f"items/{item_id}"
 
-            audio_path = item_dir / "audio.mp3"
-            segments_path = item_dir / "segments.json"
-            stt_verbose_path = item_dir / "stt_verbose.json"
+            audio_key = f"{item_prefix}/audio.mp3"
+            segments_key = f"{item_prefix}/segments.json"
+            stt_verbose_key = f"{item_prefix}/stt_verbose.json"
+            full_text_key = f"{item_prefix}/full.txt"
 
             status = st.status("Working…", expanded=True)
             try:
                 status.write("Step 1/2: Generating audio…")
-                tts_to_mp3_file(full_text[:TTS_MAX_CHARS], str(audio_path), voice=voice, speed=float(speed))
-                status.write("✅ Audio generated")
 
-                status.write("Step 2/2: Transcribing with Whisper (segments)…")
-                stt_verbose = whisper_segments_verbose_json(str(audio_path))
-                segments = extract_segments(stt_verbose)
-                save_json(stt_verbose_path, stt_verbose)
-                save_json(segments_path, segments)
+                # generate MP3 locally, then upload to storage
+                with tempfile.TemporaryDirectory() as td:
+                    tmp_audio = Path(td) / "audio.mp3"
+                    tts_to_mp3_file(full_text[:TTS_MAX_CHARS], str(tmp_audio), voice=voice, speed=float(speed))
+                    audio_bytes = tmp_audio.read_bytes()
+                    storage.write_bytes(audio_key, audio_bytes, content_type="audio/mpeg")
+
+                    status.write("✅ Audio generated")
+
+                    status.write("Step 2/2: Transcribing with Whisper (segments)…")
+                    stt_verbose = whisper_segments_verbose_json(str(tmp_audio))
+                    segments = extract_segments(stt_verbose)
+
+                storage.write_text(full_text_key, full_text)
+                storage.write_json(stt_verbose_key, stt_verbose)
+                storage.write_json(segments_key, segments)
+
                 status.write("✅ Transcript created")
-
                 status.update(label="Done", state="complete", expanded=False)
 
             except Exception as e:
@@ -360,7 +382,8 @@ if st.session_state.mode == "new":
                     "title": title,
                     "voice": voice,
                     "speed": float(speed),
-                    "item_dir": str(item_dir),
+                    # keep this, but make it storage-friendly (prefix, not local path)
+                    "item_dir": item_prefix,
                 }
             )
             save_history(history)
@@ -388,9 +411,14 @@ else:
         if not selected:
             st.subheader("Create a new Peachy :)")
         else:
-            item_dir = Path(selected["item_dir"])
-            audio_path = item_dir / "audio.mp3"
-            segments = load_json(item_dir / "segments.json", [])
+            item_id = selected["id"]
+            item_prefix = selected.get("item_dir") or f"items/{item_id}"
+
+            audio_key = f"{item_prefix}/audio.mp3"
+            segments_key = f"{item_prefix}/segments.json"
+
+            audio_bytes = storage.read_bytes(audio_key) if storage.exists(audio_key) else b""
+            segments = storage.read_json(segments_key, [])
 
             st.subheader("Playback")
             st.write(
@@ -400,8 +428,8 @@ else:
                 f'**Created:** {selected["created_at"]}'
             )
 
-            audio_player(
-                audio_path,
+            audio_player_bytes(
+                audio_bytes,
                 seek_to=st.session_state.seek_to,
                 should_play=st.session_state.pending_play,
                 marker=f"{selected['id']}_{st.session_state.seek_nonce}",
