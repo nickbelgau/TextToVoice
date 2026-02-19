@@ -18,7 +18,6 @@ def whisper_segments_verbose_json(mp3_path: str) -> dict:
                 timestamp_granularities=["segment"],
             )
         except TypeError:
-            # Older SDK fallback (verbose_json still typically includes segments)
             r = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=f,
@@ -45,10 +44,6 @@ def extract_segments(stt_verbose_json: dict) -> list[dict]:
     return out
 
 def merge_segments(segments: list[dict], max_seconds: float = 12.0, max_chars: int = 420) -> list[dict]:
-    """
-    Make segments less granular by merging adjacent ones.
-    Keeps 'start' at first start, updates 'end' to last end, concatenates text.
-    """
     merged = []
     cur = None
 

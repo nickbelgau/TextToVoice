@@ -12,13 +12,14 @@ DEFAULT_INSTRUCTIONS = (
     "Do not sound robotic."
 )
 
-def tts_to_mp3_file(
+def _tts_to_file(
     text: str,
     out_path: str,
-    voice: str = "nova",
-    speed: float = 1.0,
-    model: str = "gpt-4o-mini-tts",
-    instructions: str = DEFAULT_INSTRUCTIONS,
+    voice: str,
+    speed: float,
+    model: str,
+    instructions: str,
+    response_format: str,
 ) -> Path:
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -29,8 +30,44 @@ def tts_to_mp3_file(
         input=text,
         speed=speed,
         instructions=instructions,
-        response_format="mp3",
+        response_format=response_format,
     ) as response:
         response.stream_to_file(out)
 
     return out
+
+def tts_to_mp3_file(
+    text: str,
+    out_path: str,
+    voice: str = "nova",
+    speed: float = 1.0,
+    model: str = "gpt-4o-mini-tts",
+    instructions: str = DEFAULT_INSTRUCTIONS,
+) -> Path:
+    return _tts_to_file(
+        text=text,
+        out_path=out_path,
+        voice=voice,
+        speed=speed,
+        model=model,
+        instructions=instructions,
+        response_format="mp3",
+    )
+
+def tts_to_wav_file(
+    text: str,
+    out_path: str,
+    voice: str = "nova",
+    speed: float = 1.0,
+    model: str = "gpt-4o-mini-tts",
+    instructions: str = DEFAULT_INSTRUCTIONS,
+) -> Path:
+    return _tts_to_file(
+        text=text,
+        out_path=out_path,
+        voice=voice,
+        speed=speed,
+        model=model,
+        instructions=instructions,
+        response_format="wav",
+    )
