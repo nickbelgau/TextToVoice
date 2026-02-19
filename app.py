@@ -1,8 +1,7 @@
 # app.py
 import base64
-import json
-import uuid
 import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -34,6 +33,8 @@ VOICE_PREVIEW_TEXT = "Hi! I'm Peachy. This is a quick preview of the voice you'r
 
 DISPLAY_SEG_MAX_SECONDS = 10.0
 DISPLAY_SEG_MAX_CHARS = 520
+
+TRANSCRIPT_HEIGHT_PX = 620
 
 
 # ----------------------------
@@ -80,6 +81,25 @@ def fmt_mmss(seconds: float) -> str:
     return f"{m}:{ss:02d}"
 
 
+def make_preview(text: str, max_chars: int = PREVIEW_MAX_CHARS) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if len(t) <= max_chars:
+        return t
+
+    cut = t.rfind("\n\n", 0, max_chars)
+    if cut < 200:
+        cut = max_chars
+
+    shown = t[:cut].rstrip()
+    marker = (
+        "\n\n--- PREVIEW TRUNCATED ---\n"
+        f"(Showing first ~{len(shown):,} characters of {len(t):,})\n"
+    )
+    return shown + marker
+
+
 def scroll_box(text: str, height_px: int) -> None:
     safe = (
         (text or "")
@@ -107,23 +127,15 @@ def scroll_box(text: str, height_px: int) -> None:
     )
 
 
-def make_preview(text: str, max_chars: int = PREVIEW_MAX_CHARS) -> str:
-    t = (text or "").strip()
-    if not t:
-        return ""
-    if len(t) <= max_chars:
-        return t
-
-    cut = t.rfind("\n\n", 0, max_chars)
-    if cut < 200:
-        cut = max_chars
-
-    shown = t[:cut].rstrip()
-    marker = (
-        "\n\n--- PREVIEW TRUNCATED ---\n"
-        f"(Showing first ~{len(shown):,} characters of {len(t):,})\n"
+def html_escape(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
     )
-    return shown + marker
 
 
 def voice_preview_bytes(voice: str, speed: float) -> bytes:
@@ -133,7 +145,6 @@ def voice_preview_bytes(voice: str, speed: float) -> bytes:
     if storage.exists(key):
         return storage.read_bytes(key)
 
-    # generate locally, then upload to chosen storage
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "preview.mp3"
         tts_to_mp3_file(VOICE_PREVIEW_TEXT, str(out), voice=voice, speed=float(speed))
@@ -142,58 +153,134 @@ def voice_preview_bytes(voice: str, speed: float) -> bytes:
         return b
 
 
-def audio_player_bytes(mp3_bytes: bytes, seek_to: float, should_play: bool, marker: str) -> None:
+def try_close_sidebar_once() -> None:
     """
-    No autoplay on initial render/history change.
-    Only seeks+plays when should_play=True (user clicked a timestamp).
+    Best-effort: on mobile, if the sidebar overlay is open, click the "Close sidebar" control.
+    This is UI/DOM dependent but works in current Streamlit builds.
+    """
+    components.html(
+        """
+        <script>
+          (function() {
+            try {
+              const doc = window.parent.document;
+              const btn =
+                doc.querySelector('button[aria-label="Close sidebar"]') ||
+                doc.querySelector('button[title="Close sidebar"]') ||
+                doc.querySelector('button[data-testid="collapsedControl"]'); // fallback (sometimes used)
+              if (btn) btn.click();
+            } catch (e) {}
+          })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def render_audio_and_transcript(mp3_bytes: bytes, segments: list[dict], marker: str) -> None:
+    """
+    Option B: continuous, paragraph-like transcript where each segment span is clickable to seek+play.
+    This happens purely in the embedded HTML (no Streamlit rerun needed).
     """
     if not mp3_bytes:
         st.warning("Audio missing.")
         return
 
-    b64 = base64.b64encode(mp3_bytes).decode("utf-8")
-    dom_id = f"peachy_{marker}_{uuid.uuid4().hex}"
-    seek = float(seek_to or 0.0)
-    play_flag = "true" if should_play else "false"
+    audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
+    audio_id = f"peachy_audio_{marker}_{uuid.uuid4().hex}"
+    transcript_id = f"peachy_tx_{marker}_{uuid.uuid4().hex}"
+
+    # Build continuous text with clickable spans
+    spans = []
+    for seg in segments or []:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        txt = (seg.get("text") or "").strip()
+        if not txt:
+            continue
+
+        # keep it paragraph-like: just spaces between spans
+        # add a subtle timestamp tooltip on hover
+        tooltip = f"{fmt_mmss(start)}–{fmt_mmss(end)}"
+        spans.append(
+            f'<span class="seg" data-start="{start:.3f}" title="{html_escape(tooltip)}">{html_escape(txt)}</span>'
+        )
+
+    transcript_html = " ".join(spans) if spans else "<em>No segments found.</em>"
 
     components.html(
         f"""
-        <div style="width:100%;">
-          <audio id="{dom_id}" controls style="width:100%;">
-            <source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg" />
+        <div class="wrap">
+          <audio id="{audio_id}" controls style="width:100%;">
+            <source src="data:audio/mpeg;base64,{audio_b64}" type="audio/mpeg" />
           </audio>
+
+          <div id="{transcript_id}" class="transcript">
+            {transcript_html}
+          </div>
         </div>
+
+        <style>
+          .wrap {{
+            width: 100%;
+            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+          }}
+          .transcript {{
+            margin-top: 12px;
+            height: {TRANSCRIPT_HEIGHT_PX}px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 14px;
+            border-radius: 12px;
+            line-height: 1.55;
+            font-size: 16px;
+            background: #fff;
+          }}
+          .seg {{
+            cursor: pointer;
+            border-radius: 6px;
+            padding: 1px 2px;
+          }}
+          .seg:hover {{
+            background: rgba(183, 91, 85, 0.12);
+          }}
+          .seg.active {{
+            background: rgba(183, 91, 85, 0.22);
+          }}
+        </style>
 
         <script>
           (function() {{
-            const a = document.getElementById("{dom_id}");
-            const seekTo = {seek};
-            const shouldPlay = {play_flag};
+            const audio = document.getElementById("{audio_id}");
+            const box = document.getElementById("{transcript_id}");
+            if (!audio || !box) return;
 
-            if (!shouldPlay) return;
+            box.addEventListener("click", (e) => {{
+              const el = e.target.closest(".seg");
+              if (!el) return;
 
-            const start = () => {{
-              try {{ a.currentTime = Math.max(0, seekTo); }} catch(e) {{}}
-              a.play().catch(()=>{{}});
-            }};
+              // visual active state
+              try {{
+                box.querySelectorAll(".seg.active").forEach(x => x.classList.remove("active"));
+                el.classList.add("active");
+              }} catch (err) {{}}
 
-            if (a.readyState >= 1) {{
-              start();
-            }} else {{
-              a.addEventListener("loadedmetadata", start, {{ once: true }});
-              a.load();
-            }}
+              const t = parseFloat(el.dataset.start || "0");
+              try {{ audio.currentTime = Math.max(0, t); }} catch (err) {{}}
+              audio.play().catch(() => {{}});
+            }});
           }})();
         </script>
         """,
-        height=90,
+        height=90 + TRANSCRIPT_HEIGHT_PX + 40,
+        scrolling=False,
     )
 
 
 # ----------------------------
 # App state
 # ----------------------------
-st.set_page_config(page_title="Peachy", layout="centered")
+st.set_page_config(page_title="Peachy", layout="wide")
 
 history = load_history()
 history_sorted = sorted(history, key=lambda x: x["created_at"], reverse=True)
@@ -208,15 +295,12 @@ if "pending_doc" not in st.session_state:
 if "force_select_id" not in st.session_state:
     st.session_state.force_select_id = None
 
-if "seek_to" not in st.session_state:
-    st.session_state.seek_to = 0.0
-if "seek_nonce" not in st.session_state:
-    st.session_state.seek_nonce = 0
-if "pending_play" not in st.session_state:
-    st.session_state.pending_play = False
-
 if "new_voice" not in st.session_state:
     st.session_state.new_voice = VOICES[0]
+
+# for mobile UX: close sidebar overlay after selecting New Peachy
+if "request_close_sidebar" not in st.session_state:
+    st.session_state.request_close_sidebar = False
 
 # Defaults BEFORE widgets
 if ids and st.session_state.selected_id is None:
@@ -259,9 +343,7 @@ with st.sidebar:
         if st.button("New Peachy 🍑", type="primary", use_container_width=True, key="btn_new_peachy"):
             st.session_state.mode = "new"
             st.session_state.pending_doc = None
-            st.session_state.seek_to = 0.0
-            st.session_state.pending_play = False
-            st.session_state.seek_nonce += 1
+            st.session_state.request_close_sidebar = True
             st.rerun()
 
     st.divider()
@@ -280,10 +362,13 @@ with st.sidebar:
         if picked != st.session_state.selected_id:
             st.session_state.selected_id = picked
             st.session_state.mode = "playback"
-            st.session_state.seek_to = 0.0
-            st.session_state.pending_play = False
-            st.session_state.seek_nonce += 1
             st.rerun()
+
+
+# If requested, close sidebar overlay (mobile UX)
+if st.session_state.request_close_sidebar:
+    try_close_sidebar_once()
+    st.session_state.request_close_sidebar = False
 
 
 # ----------------------------
@@ -306,7 +391,6 @@ if st.session_state.mode == "new":
     )
     st.session_state.new_voice = voice
 
-    # preview stored in the same storage backend (local or B2)
     st.audio(voice_preview_bytes(voice, speed), format="audio/mp3")
 
     up = st.file_uploader(
@@ -340,7 +424,6 @@ if st.session_state.mode == "new":
             full_text = st.session_state.pending_doc["text"]
 
             item_prefix = f"items/{item_id}"
-
             audio_key = f"{item_prefix}/audio.mp3"
             segments_key = f"{item_prefix}/segments.json"
             stt_verbose_key = f"{item_prefix}/stt_verbose.json"
@@ -350,16 +433,16 @@ if st.session_state.mode == "new":
             try:
                 status.write("Step 1/2: Generating audio…")
 
-                # generate MP3 locally, then upload to storage
                 with tempfile.TemporaryDirectory() as td:
                     tmp_audio = Path(td) / "audio.mp3"
                     tts_to_mp3_file(full_text[:TTS_MAX_CHARS], str(tmp_audio), voice=voice, speed=float(speed))
+
                     audio_bytes = tmp_audio.read_bytes()
                     storage.write_bytes(audio_key, audio_bytes, content_type="audio/mpeg")
 
                     status.write("✅ Audio generated")
-
                     status.write("Step 2/2: Transcribing with Whisper (segments)…")
+
                     stt_verbose = whisper_segments_verbose_json(str(tmp_audio))
                     segments = extract_segments(stt_verbose)
 
@@ -382,8 +465,7 @@ if st.session_state.mode == "new":
                     "title": title,
                     "voice": voice,
                     "speed": float(speed),
-                    # keep this, but make it storage-friendly (prefix, not local path)
-                    "item_dir": item_prefix,
+                    "item_dir": item_prefix,  # storage prefix, not a local path
                 }
             )
             save_history(history)
@@ -392,9 +474,6 @@ if st.session_state.mode == "new":
             st.session_state.force_select_id = item_id
             st.session_state.mode = "playback"
             st.session_state.pending_doc = None
-            st.session_state.seek_to = 0.0
-            st.session_state.pending_play = False
-            st.session_state.seek_nonce += 1
             st.rerun()
     else:
         st.caption("Upload a file to see a preview, then generate audio.")
@@ -428,32 +507,15 @@ else:
                 f'**Created:** {selected["created_at"]}'
             )
 
-            audio_player_bytes(
-                audio_bytes,
-                seek_to=st.session_state.seek_to,
-                should_play=st.session_state.pending_play,
-                marker=f"{selected['id']}_{st.session_state.seek_nonce}",
-            )
-            st.session_state.pending_play = False
-
             display_segments = merge_segments(
                 segments or [],
                 max_seconds=DISPLAY_SEG_MAX_SECONDS,
                 max_chars=DISPLAY_SEG_MAX_CHARS,
             )
 
-            st.markdown("### Transcript")
-            if not display_segments:
-                st.caption("No segments found.")
-            else:
-                for i, seg in enumerate(display_segments):
-                    start = float(seg.get("start", 0.0))
-                    end = float(seg.get("end", start))
-                    txt = (seg.get("text") or "").strip()
-                    label = f"{fmt_mmss(start)}–{fmt_mmss(end)}  {txt}"
-
-                    if st.button(label, key=f"seg_{selected['id']}_{i}", use_container_width=True):
-                        st.session_state.seek_to = start
-                        st.session_state.pending_play = True
-                        st.session_state.seek_nonce += 1
-                        st.rerun()
+            st.markdown("### Transcript (tap to jump)")
+            render_audio_and_transcript(
+                mp3_bytes=audio_bytes,
+                segments=display_segments,
+                marker=f"{item_id}",
+            )
