@@ -1,4 +1,3 @@
-# core/storage.py
 from __future__ import annotations
 
 import json
@@ -28,7 +27,6 @@ class Storage:
     def exists(self, key: str) -> bool:
         raise NotImplementedError
 
-    # convenience helpers
     def write_text(self, key: str, text: str, encoding: str = "utf-8") -> None:
         self.write_bytes(key, (text or "").encode(encoding), content_type="text/plain; charset=utf-8")
 
@@ -50,7 +48,7 @@ class Storage:
 
 @dataclass
 class LocalStorage(Storage):
-    root: Path  # e.g. Path.cwd() / "data"
+    root: Path
 
     def _path(self, key: str) -> Path:
         return self.root / Path(_clean_key(key))
@@ -73,7 +71,7 @@ class B2Storage(Storage):
     bucket: str
     access_key_id: str
     secret_access_key: str
-    prefix: str = ""  # optional, e.g. "peachy"
+    prefix: str = ""
 
     def __post_init__(self) -> None:
         self.prefix = _clean_key(self.prefix).rstrip("/")

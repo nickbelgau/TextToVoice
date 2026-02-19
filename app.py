@@ -1,5 +1,5 @@
-# app.py
 import base64
+import json
 import tempfile
 import uuid
 from datetime import datetime
@@ -10,15 +10,19 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from core.extract_text import extract_text
-from core.tts import tts_to_mp3_file
+from core.tts import tts_to_wav_file, tts_to_mp3_file
 from core.stt import whisper_segments_verbose_json, extract_segments, merge_segments
 from core.storage import LocalStorage, B2Storage, Storage
+from core.audio_utils import wav_duration_seconds, stitch_wavs, convert_wav_to_mp3
 
 # ----------------------------
 # Config
 # ----------------------------
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MB
-TTS_MAX_CHARS = 4096
+
+# TTS chunking:
+# TTS endpoint supports ~4096 chars max per request; keep buffer so we can split on boundaries safely.
+TTS_CHUNK_MAX_CHARS = 3600
 
 PREVIEW_MAX_CHARS = 1200
 PREVIEW_HEIGHT_PX = 160
@@ -31,10 +35,14 @@ HISTORY_KEY = "history.json"
 VOICES = ["cedar", "nova", "alloy", "marin"]
 VOICE_PREVIEW_TEXT = "Hi! I'm Peachy. This is a quick preview of the voice you're about to choose."
 
+# For display merging (readable segments)
 DISPLAY_SEG_MAX_SECONDS = 10.0
 DISPLAY_SEG_MAX_CHARS = 520
 
-TRANSCRIPT_HEIGHT_PX = 620
+# Clickable transcript panel height
+TRANSCRIPT_HEIGHT_PX = 650
+
+TZ = ZoneInfo("America/Los_Angeles")
 
 
 # ----------------------------
@@ -70,7 +78,7 @@ def save_history(items: list[dict]) -> None:
 
 
 def now_pt_string() -> str:
-    dt = datetime.now(ZoneInfo("America/Los_Angeles"))
+    dt = datetime.now(TZ)
     return dt.strftime("%Y-%m-%d %I:%M %p")
 
 
@@ -138,6 +146,60 @@ def html_escape(s: str) -> str:
     )
 
 
+def split_text_into_chunks(text: str, max_chars: int = TTS_CHUNK_MAX_CHARS) -> list[str]:
+    """
+    Split text into chunks <= max_chars, preferring paragraph boundaries, then sentence-ish boundaries.
+    Keeps it simple and deterministic.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+
+    paras = [p.strip() for p in t.split("\n\n") if p.strip()]
+    chunks: list[str] = []
+    cur = ""
+
+    def flush():
+        nonlocal cur
+        if cur.strip():
+            chunks.append(cur.strip())
+        cur = ""
+
+    for p in paras:
+        # If paragraph itself is huge, split within it
+        if len(p) > max_chars:
+            # flush any accumulated chunk first
+            flush()
+            start = 0
+            while start < len(p):
+                end = min(len(p), start + max_chars)
+                # try to cut at a period/space near end
+                cut = p.rfind(". ", start, end)
+                if cut == -1 or cut < start + int(max_chars * 0.6):
+                    cut = p.rfind(" ", start, end)
+                if cut == -1 or cut <= start:
+                    cut = end
+                else:
+                    cut = cut + 1  # include period or space
+                piece = p[start:cut].strip()
+                if piece:
+                    chunks.append(piece)
+                start = cut
+            continue
+
+        # Try to add paragraph to current chunk
+        if not cur:
+            cur = p
+        elif len(cur) + 2 + len(p) <= max_chars:
+            cur = cur + "\n\n" + p
+        else:
+            flush()
+            cur = p
+
+    flush()
+    return chunks
+
+
 def voice_preview_bytes(voice: str, speed: float) -> bytes:
     speed_key = f"{float(speed):.2f}".replace(".", "_")
     key = f"voice_previews/{voice}_s{speed_key}.mp3"
@@ -155,8 +217,7 @@ def voice_preview_bytes(voice: str, speed: float) -> bytes:
 
 def try_close_sidebar_once() -> None:
     """
-    Best-effort: on mobile, if the sidebar overlay is open, click the "Close sidebar" control.
-    This is UI/DOM dependent but works in current Streamlit builds.
+    Best-effort: if the sidebar is open as an overlay on mobile, click the 'Close sidebar' control.
     """
     components.html(
         """
@@ -167,7 +228,7 @@ def try_close_sidebar_once() -> None:
               const btn =
                 doc.querySelector('button[aria-label="Close sidebar"]') ||
                 doc.querySelector('button[title="Close sidebar"]') ||
-                doc.querySelector('button[data-testid="collapsedControl"]'); // fallback (sometimes used)
+                doc.querySelector('button[data-testid="collapsedControl"]');
               if (btn) btn.click();
             } catch (e) {}
           })();
@@ -177,20 +238,19 @@ def try_close_sidebar_once() -> None:
     )
 
 
-def render_audio_and_transcript(mp3_bytes: bytes, segments: list[dict], marker: str) -> None:
+def render_audio_and_transcript(mp3_or_wav_bytes: bytes, mime: str, segments: list[dict], marker: str) -> None:
     """
-    Option B: continuous, paragraph-like transcript where each segment span is clickable to seek+play.
-    This happens purely in the embedded HTML (no Streamlit rerun needed).
+    Option B: Continuous paragraph-like transcript; each segment is a clickable span that seeks+plays.
+    Seeking happens in JS (no Streamlit rerun needed).
     """
-    if not mp3_bytes:
+    if not mp3_or_wav_bytes:
         st.warning("Audio missing.")
         return
 
-    audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
+    audio_b64 = base64.b64encode(mp3_or_wav_bytes).decode("utf-8")
     audio_id = f"peachy_audio_{marker}_{uuid.uuid4().hex}"
     transcript_id = f"peachy_tx_{marker}_{uuid.uuid4().hex}"
 
-    # Build continuous text with clickable spans
     spans = []
     for seg in segments or []:
         start = float(seg.get("start", 0.0))
@@ -198,9 +258,6 @@ def render_audio_and_transcript(mp3_bytes: bytes, segments: list[dict], marker: 
         txt = (seg.get("text") or "").strip()
         if not txt:
             continue
-
-        # keep it paragraph-like: just spaces between spans
-        # add a subtle timestamp tooltip on hover
         tooltip = f"{fmt_mmss(start)}–{fmt_mmss(end)}"
         spans.append(
             f'<span class="seg" data-start="{start:.3f}" title="{html_escape(tooltip)}">{html_escape(txt)}</span>'
@@ -212,7 +269,7 @@ def render_audio_and_transcript(mp3_bytes: bytes, segments: list[dict], marker: 
         f"""
         <div class="wrap">
           <audio id="{audio_id}" controls style="width:100%;">
-            <source src="data:audio/mpeg;base64,{audio_b64}" type="audio/mpeg" />
+            <source src="data:{mime};base64,{audio_b64}" type="{mime}" />
           </audio>
 
           <div id="{transcript_id}" class="transcript">
@@ -259,7 +316,6 @@ def render_audio_and_transcript(mp3_bytes: bytes, segments: list[dict], marker: 
               const el = e.target.closest(".seg");
               if (!el) return;
 
-              // visual active state
               try {{
                 box.querySelectorAll(".seg.active").forEach(x => x.classList.remove("active"));
                 el.classList.add("active");
@@ -294,11 +350,8 @@ if "pending_doc" not in st.session_state:
     st.session_state.pending_doc = None
 if "force_select_id" not in st.session_state:
     st.session_state.force_select_id = None
-
 if "new_voice" not in st.session_state:
     st.session_state.new_voice = VOICES[0]
-
-# for mobile UX: close sidebar overlay after selecting New Peachy
 if "request_close_sidebar" not in st.session_state:
     st.session_state.request_close_sidebar = False
 
@@ -365,7 +418,7 @@ with st.sidebar:
             st.rerun()
 
 
-# If requested, close sidebar overlay (mobile UX)
+# Close sidebar overlay on mobile (best effort)
 if st.session_state.request_close_sidebar:
     try_close_sidebar_once()
     st.session_state.request_close_sidebar = False
@@ -423,34 +476,100 @@ if st.session_state.mode == "new":
             title = st.session_state.pending_doc["title"]
             full_text = st.session_state.pending_doc["text"]
 
+            chunks = split_text_into_chunks(full_text, max_chars=TTS_CHUNK_MAX_CHARS)
+            if not chunks:
+                st.error("No text extracted from this file.")
+                st.stop()
+
             item_prefix = f"items/{item_id}"
-            audio_key = f"{item_prefix}/audio.mp3"
-            segments_key = f"{item_prefix}/segments.json"
-            stt_verbose_key = f"{item_prefix}/stt_verbose.json"
             full_text_key = f"{item_prefix}/full.txt"
+            segments_key = f"{item_prefix}/segments.json"
+            manifest_key = f"{item_prefix}/manifest.json"
+
+            # final audio key decided later (mp3 preferred, wav fallback)
+            audio_mp3_key = f"{item_prefix}/audio.mp3"
+            audio_wav_key = f"{item_prefix}/audio.wav"
 
             status = st.status("Working…", expanded=True)
+
             try:
-                status.write("Step 1/2: Generating audio…")
+                status.write(f"Step 1/3: Generating {len(chunks)} audio chunks (WAV)…")
+
+                all_segments: list[dict] = []
+                manifest = {
+                    "id": item_id,
+                    "title": title,
+                    "created_at": created_at,
+                    "voice": voice,
+                    "speed": float(speed),
+                    "tts_chunk_max_chars": TTS_CHUNK_MAX_CHARS,
+                    "chunks": [],
+                }
 
                 with tempfile.TemporaryDirectory() as td:
-                    tmp_audio = Path(td) / "audio.mp3"
-                    tts_to_mp3_file(full_text[:TTS_MAX_CHARS], str(tmp_audio), voice=voice, speed=float(speed))
+                    td = Path(td)
+                    wav_paths: list[Path] = []
+                    offset = 0.0
 
-                    audio_bytes = tmp_audio.read_bytes()
-                    storage.write_bytes(audio_key, audio_bytes, content_type="audio/mpeg")
+                    # generate + transcribe each chunk
+                    for i, chunk_text in enumerate(chunks):
+                        status.write(f"Chunk {i+1}/{len(chunks)}: TTS → WAV")
+                        wav_path = td / f"chunk_{i:04d}.wav"
+                        tts_to_wav_file(chunk_text, str(wav_path), voice=voice, speed=float(speed))
 
-                    status.write("✅ Audio generated")
-                    status.write("Step 2/2: Transcribing with Whisper (segments)…")
+                        dur = wav_duration_seconds(wav_path)
+                        wav_paths.append(wav_path)
 
-                    stt_verbose = whisper_segments_verbose_json(str(tmp_audio))
-                    segments = extract_segments(stt_verbose)
+                        status.write(f"Chunk {i+1}/{len(chunks)}: STT (timestamps)")
+                        stt_verbose = whisper_segments_verbose_json(str(wav_path))
+                        segs = extract_segments(stt_verbose)
 
-                storage.write_text(full_text_key, full_text)
-                storage.write_json(stt_verbose_key, stt_verbose)
-                storage.write_json(segments_key, segments)
+                        # offset timestamps into global timeline
+                        for s in segs:
+                            s["start"] = float(s.get("start", 0.0)) + offset
+                            s["end"] = float(s.get("end", 0.0)) + offset
+                            all_segments.append(s)
 
-                status.write("✅ Transcript created")
+                        manifest["chunks"].append(
+                            {
+                                "index": i,
+                                "chars": len(chunk_text),
+                                "duration_seconds": dur,
+                                "offset_seconds": offset,
+                            }
+                        )
+
+                        offset += dur
+
+                    status.write("Step 2/3: Stitching WAV chunks → master.wav")
+                    master_wav = td / "master.wav"
+                    stitch_wavs(wav_paths, master_wav)
+
+                    # Upload full text now (just once)
+                    storage.write_text(full_text_key, full_text)
+
+                    status.write("Step 3/3: Converting master.wav → audio.mp3 (single encode)")
+                    master_mp3 = td / "audio.mp3"
+                    audio_mime = "audio/mpeg"
+                    audio_key = audio_mp3_key
+
+                    try:
+                        convert_wav_to_mp3(master_wav, master_mp3, bitrate_kbps=64)
+                        audio_bytes = master_mp3.read_bytes()
+                        storage.write_bytes(audio_key, audio_bytes, content_type="audio/mpeg")
+                        manifest["audio"] = {"format": "mp3", "key": audio_key}
+                    except Exception:
+                        # Fallback: store WAV if ffmpeg isn't available
+                        audio_bytes = master_wav.read_bytes()
+                        audio_key = audio_wav_key
+                        audio_mime = "audio/wav"
+                        storage.write_bytes(audio_key, audio_bytes, content_type="audio/wav")
+                        manifest["audio"] = {"format": "wav", "key": audio_key}
+
+                # Save transcript + manifest
+                storage.write_json(segments_key, all_segments)
+                storage.write_json(manifest_key, manifest)
+
                 status.update(label="Done", state="complete", expanded=False)
 
             except Exception as e:
@@ -465,7 +584,7 @@ if st.session_state.mode == "new":
                     "title": title,
                     "voice": voice,
                     "speed": float(speed),
-                    "item_dir": item_prefix,  # storage prefix, not a local path
+                    "item_dir": item_prefix,
                 }
             )
             save_history(history)
@@ -493,11 +612,33 @@ else:
             item_id = selected["id"]
             item_prefix = selected.get("item_dir") or f"items/{item_id}"
 
-            audio_key = f"{item_prefix}/audio.mp3"
             segments_key = f"{item_prefix}/segments.json"
+            manifest_key = f"{item_prefix}/manifest.json"
+            audio_mp3_key = f"{item_prefix}/audio.mp3"
+            audio_wav_key = f"{item_prefix}/audio.wav"
 
-            audio_bytes = storage.read_bytes(audio_key) if storage.exists(audio_key) else b""
             segments = storage.read_json(segments_key, [])
+            manifest = storage.read_json(manifest_key, {})
+
+            # prefer mp3 if present
+            if storage.exists(audio_mp3_key):
+                audio_key = audio_mp3_key
+                audio_mime = "audio/mpeg"
+            elif storage.exists(audio_wav_key):
+                audio_key = audio_wav_key
+                audio_mime = "audio/wav"
+            else:
+                # last resort: check manifest
+                ak = (manifest.get("audio") or {}).get("key")
+                af = (manifest.get("audio") or {}).get("format")
+                if ak and storage.exists(ak):
+                    audio_key = ak
+                    audio_mime = "audio/mpeg" if af == "mp3" else "audio/wav"
+                else:
+                    audio_key = ""
+                    audio_mime = "audio/mpeg"
+
+            audio_bytes = storage.read_bytes(audio_key) if audio_key else b""
 
             st.subheader("Playback")
             st.write(
@@ -515,7 +656,8 @@ else:
 
             st.markdown("### Transcript (tap to jump)")
             render_audio_and_transcript(
-                mp3_bytes=audio_bytes,
+                mp3_or_wav_bytes=audio_bytes,
+                mime=audio_mime,
                 segments=display_segments,
                 marker=f"{item_id}",
             )
