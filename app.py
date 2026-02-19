@@ -1,5 +1,7 @@
+# app.py
 import base64
 import json
+import re
 import tempfile
 import uuid
 from datetime import datetime
@@ -14,14 +16,14 @@ from core.tts import tts_to_wav_file, tts_to_mp3_file
 from core.stt import whisper_segments_verbose_json, extract_segments, merge_segments
 from core.storage import LocalStorage, B2Storage, Storage
 from core.audio_utils import wav_duration_seconds, stitch_wavs, convert_wav_to_mp3
+from core.alignment import align_segments_to_text, AlignConfig
 
 # ----------------------------
 # Config
 # ----------------------------
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MB
 
-# TTS chunking:
-# TTS endpoint supports ~4096 chars max per request; keep buffer so we can split on boundaries safely.
+# TTS: stay below the per-request limit with buffer
 TTS_CHUNK_MAX_CHARS = 3600
 
 PREVIEW_MAX_CHARS = 1200
@@ -35,12 +37,11 @@ HISTORY_KEY = "history.json"
 VOICES = ["cedar", "nova", "alloy", "marin"]
 VOICE_PREVIEW_TEXT = "Hi! I'm Peachy. This is a quick preview of the voice you're about to choose."
 
-# For display merging (readable segments)
+# Merge for a nicer UI + better alignment anchors
 DISPLAY_SEG_MAX_SECONDS = 10.0
 DISPLAY_SEG_MAX_CHARS = 520
 
-# Clickable transcript panel height
-TRANSCRIPT_HEIGHT_PX = 650
+READING_HEIGHT_PX = 700
 
 TZ = ZoneInfo("America/Los_Angeles")
 
@@ -57,7 +58,7 @@ def get_storage() -> Storage:
             bucket=st.secrets["B2_BUCKET"],
             access_key_id=st.secrets["B2_ACCESS_KEY_ID"],
             secret_access_key=st.secrets["B2_SECRET_APPL_KEY"],
-            prefix=st.secrets.get("B2_PREFIX", ""),  # optional
+            prefix=st.secrets.get("B2_PREFIX", ""),
         )
 
     return LocalStorage(root=DATA_DIR)
@@ -80,13 +81,6 @@ def save_history(items: list[dict]) -> None:
 def now_pt_string() -> str:
     dt = datetime.now(TZ)
     return dt.strftime("%Y-%m-%d %I:%M %p")
-
-
-def fmt_mmss(seconds: float) -> str:
-    s = int(max(0, seconds))
-    m = s // 60
-    ss = s % 60
-    return f"{m}:{ss:02d}"
 
 
 def make_preview(text: str, max_chars: int = PREVIEW_MAX_CHARS) -> str:
@@ -146,58 +140,79 @@ def html_escape(s: str) -> str:
     )
 
 
-def split_text_into_chunks(text: str, max_chars: int = TTS_CHUNK_MAX_CHARS) -> list[str]:
+def split_text_into_chunks_with_offsets(text: str, max_chars: int) -> list[dict]:
     """
-    Split text into chunks <= max_chars, preferring paragraph boundaries, then sentence-ish boundaries.
-    Keeps it simple and deterministic.
+    Returns list of:
+      { "text": <exact substring>, "orig_start": int, "orig_end": int }
+    Splits on paragraph boundaries when possible, else splits inside long paragraphs.
     """
-    t = (text or "").strip()
-    if not t:
+    if not text:
         return []
 
-    paras = [p.strip() for p in t.split("\n\n") if p.strip()]
-    chunks: list[str] = []
-    cur = ""
+    # paragraph separators: 2+ newlines
+    sep_pat = re.compile(r"\n{2,}")
+    spans: list[tuple[int, int]] = []
+
+    start = 0
+    for m in sep_pat.finditer(text):
+        end = m.end()  # include separator in span
+        spans.append((start, end))
+        start = end
+    if start < len(text):
+        spans.append((start, len(text)))
+
+    chunks: list[dict] = []
+    cur_start = None
+    cur_end = None
 
     def flush():
-        nonlocal cur
-        if cur.strip():
-            chunks.append(cur.strip())
-        cur = ""
+        nonlocal cur_start, cur_end
+        if cur_start is None or cur_end is None or cur_end <= cur_start:
+            cur_start, cur_end = None, None
+            return
+        chunk_text = text[cur_start:cur_end]
+        chunks.append({"text": chunk_text, "orig_start": cur_start, "orig_end": cur_end})
+        cur_start, cur_end = None, None
 
-    for p in paras:
-        # If paragraph itself is huge, split within it
-        if len(p) > max_chars:
-            # flush any accumulated chunk first
+    for (p_start, p_end) in spans:
+        p_len = p_end - p_start
+
+        # If paragraph span itself is huge, split inside it
+        if p_len > max_chars:
             flush()
-            start = 0
-            while start < len(p):
-                end = min(len(p), start + max_chars)
-                # try to cut at a period/space near end
-                cut = p.rfind(". ", start, end)
-                if cut == -1 or cut < start + int(max_chars * 0.6):
-                    cut = p.rfind(" ", start, end)
-                if cut == -1 or cut <= start:
-                    cut = end
-                else:
-                    cut = cut + 1  # include period or space
-                piece = p[start:cut].strip()
-                if piece:
-                    chunks.append(piece)
-                start = cut
+            i = p_start
+            while i < p_end:
+                j = min(p_end, i + max_chars)
+
+                # try to cut at sentence boundary
+                slice_ = text[i:j]
+                cut = slice_.rfind(". ")
+                if cut < int(max_chars * 0.55):
+                    cut = slice_.rfind(" ")
+                if cut <= 0:
+                    cut = len(slice_)
+
+                piece_end = i + cut
+                if piece_end <= i:
+                    piece_end = j
+
+                chunks.append({"text": text[i:piece_end], "orig_start": i, "orig_end": piece_end})
+                i = piece_end
             continue
 
-        # Try to add paragraph to current chunk
-        if not cur:
-            cur = p
-        elif len(cur) + 2 + len(p) <= max_chars:
-            cur = cur + "\n\n" + p
+        # Normal paragraph: try to add into current chunk
+        if cur_start is None:
+            cur_start, cur_end = p_start, p_end
         else:
-            flush()
-            cur = p
+            if (p_end - cur_start) <= max_chars:
+                cur_end = p_end
+            else:
+                flush()
+                cur_start, cur_end = p_start, p_end
 
     flush()
-    return chunks
+    # filter empty-ish
+    return [c for c in chunks if (c["text"] or "").strip()]
 
 
 def voice_preview_bytes(voice: str, speed: float) -> bytes:
@@ -216,9 +231,6 @@ def voice_preview_bytes(voice: str, speed: float) -> bytes:
 
 
 def try_close_sidebar_once() -> None:
-    """
-    Best-effort: if the sidebar is open as an overlay on mobile, click the 'Close sidebar' control.
-    """
     components.html(
         """
         <script>
@@ -238,32 +250,60 @@ def try_close_sidebar_once() -> None:
     )
 
 
-def render_audio_and_transcript(mp3_or_wav_bytes: bytes, mime: str, segments: list[dict], marker: str) -> None:
+def render_audio_and_clickable_doc(audio_bytes: bytes, mime: str, full_text: str, segments: list[dict], marker: str) -> None:
     """
-    Option B: Continuous paragraph-like transcript; each segment is a clickable span that seeks+plays.
-    Seeking happens in JS (no Streamlit rerun needed).
+    Shows original extracted text (format preserved via pre-wrap).
+    Click highlighted spans to seek+play audio.
     """
-    if not mp3_or_wav_bytes:
+    if not audio_bytes:
         st.warning("Audio missing.")
         return
 
-    audio_b64 = base64.b64encode(mp3_or_wav_bytes).decode("utf-8")
-    audio_id = f"peachy_audio_{marker}_{uuid.uuid4().hex}"
-    transcript_id = f"peachy_tx_{marker}_{uuid.uuid4().hex}"
+    segs = [
+        s for s in (segments or [])
+        if isinstance(s, dict) and "orig_char_start" in s and "orig_char_end" in s and "start" in s
+    ]
+    segs.sort(key=lambda x: int(x["orig_char_start"]))
 
-    spans = []
-    for seg in segments or []:
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", start))
-        txt = (seg.get("text") or "").strip()
-        if not txt:
+    if not segs:
+        st.caption("No aligned spans were found. (Transcript still exists, but can’t map to original text yet.)")
+        return
+
+    # Build HTML with spans inserted into original text
+    pos = 0
+    parts: list[str] = []
+    n = len(full_text)
+
+    for s in segs:
+        a = int(s["orig_char_start"])
+        b = int(s["orig_char_end"])
+        t = float(s["start"])
+
+        if a < pos:
             continue
-        tooltip = f"{fmt_mmss(start)}–{fmt_mmss(end)}"
-        spans.append(
-            f'<span class="seg" data-start="{start:.3f}" title="{html_escape(tooltip)}">{html_escape(txt)}</span>'
-        )
+        if b <= a:
+            continue
+        if a > n:
+            break
+        b = min(b, n)
 
-    transcript_html = " ".join(spans) if spans else "<em>No segments found.</em>"
+        if pos < a:
+            parts.append(html_escape(full_text[pos:a]))
+
+        span_text = full_text[a:b]
+        parts.append(
+            f'<span class="seg" data-start="{t:.3f}">{html_escape(span_text)}</span>'
+        )
+        pos = b
+
+    if pos < n:
+        parts.append(html_escape(full_text[pos:]))
+
+    doc_html = "".join(parts)
+
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    audio_id = f"peachy_audio_{marker}_{uuid.uuid4().hex}"
+    doc_id = f"peachy_doc_{marker}_{uuid.uuid4().hex}"
 
     components.html(
         f"""
@@ -272,8 +312,8 @@ def render_audio_and_transcript(mp3_or_wav_bytes: bytes, mime: str, segments: li
             <source src="data:{mime};base64,{audio_b64}" type="{mime}" />
           </audio>
 
-          <div id="{transcript_id}" class="transcript">
-            {transcript_html}
+          <div id="{doc_id}" class="doc">
+            {doc_html}
           </div>
         </div>
 
@@ -282,9 +322,9 @@ def render_audio_and_transcript(mp3_or_wav_bytes: bytes, mime: str, segments: li
             width: 100%;
             font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
           }}
-          .transcript {{
+          .doc {{
             margin-top: 12px;
-            height: {TRANSCRIPT_HEIGHT_PX}px;
+            height: {READING_HEIGHT_PX}px;
             overflow-y: auto;
             border: 1px solid #ddd;
             padding: 14px;
@@ -292,11 +332,12 @@ def render_audio_and_transcript(mp3_or_wav_bytes: bytes, mime: str, segments: li
             line-height: 1.55;
             font-size: 16px;
             background: #fff;
+            white-space: pre-wrap;
           }}
           .seg {{
             cursor: pointer;
             border-radius: 6px;
-            padding: 1px 2px;
+            padding: 0px 2px;
           }}
           .seg:hover {{
             background: rgba(183, 91, 85, 0.12);
@@ -309,7 +350,7 @@ def render_audio_and_transcript(mp3_or_wav_bytes: bytes, mime: str, segments: li
         <script>
           (function() {{
             const audio = document.getElementById("{audio_id}");
-            const box = document.getElementById("{transcript_id}");
+            const box = document.getElementById("{doc_id}");
             if (!audio || !box) return;
 
             box.addEventListener("click", (e) => {{
@@ -328,7 +369,7 @@ def render_audio_and_transcript(mp3_or_wav_bytes: bytes, mime: str, segments: li
           }})();
         </script>
         """,
-        height=90 + TRANSCRIPT_HEIGHT_PX + 40,
+        height=90 + READING_HEIGHT_PX + 40,
         scrolling=False,
     )
 
@@ -355,7 +396,6 @@ if "new_voice" not in st.session_state:
 if "request_close_sidebar" not in st.session_state:
     st.session_state.request_close_sidebar = False
 
-# Defaults BEFORE widgets
 if ids and st.session_state.selected_id is None:
     st.session_state.selected_id = ids[0]
 
@@ -418,7 +458,6 @@ with st.sidebar:
             st.rerun()
 
 
-# Close sidebar overlay on mobile (best effort)
 if st.session_state.request_close_sidebar:
     try_close_sidebar_once()
     st.session_state.request_close_sidebar = False
@@ -462,7 +501,7 @@ if st.session_state.mode == "new":
         if size > MAX_UPLOAD_BYTES:
             st.error("File too large. Max is 2 MB.")
         else:
-            text = extract_text(up.name, raw).strip()
+            text = extract_text(up.name, raw)
             st.session_state.pending_doc = {"title": up.name, "text": text}
 
     if st.session_state.pending_doc:
@@ -474,9 +513,9 @@ if st.session_state.mode == "new":
             created_at = now_pt_string()
 
             title = st.session_state.pending_doc["title"]
-            full_text = st.session_state.pending_doc["text"]
+            full_text = st.session_state.pending_doc["text"] or ""
 
-            chunks = split_text_into_chunks(full_text, max_chars=TTS_CHUNK_MAX_CHARS)
+            chunks = split_text_into_chunks_with_offsets(full_text, max_chars=TTS_CHUNK_MAX_CHARS)
             if not chunks:
                 st.error("No text extracted from this file.")
                 st.stop()
@@ -486,14 +525,13 @@ if st.session_state.mode == "new":
             segments_key = f"{item_prefix}/segments.json"
             manifest_key = f"{item_prefix}/manifest.json"
 
-            # final audio key decided later (mp3 preferred, wav fallback)
             audio_mp3_key = f"{item_prefix}/audio.mp3"
             audio_wav_key = f"{item_prefix}/audio.wav"
 
             status = st.status("Working…", expanded=True)
 
             try:
-                status.write(f"Step 1/3: Generating {len(chunks)} audio chunks (WAV)…")
+                status.write(f"Step 1/3: Generating {len(chunks)} audio chunks (WAV) + STT…")
 
                 all_segments: list[dict] = []
                 manifest = {
@@ -506,13 +544,18 @@ if st.session_state.mode == "new":
                     "chunks": [],
                 }
 
+                align_cfg = AlignConfig(lookback=250, ahead=9000, threshold=78, min_query_len=10)
+
                 with tempfile.TemporaryDirectory() as td:
                     td = Path(td)
                     wav_paths: list[Path] = []
-                    offset = 0.0
+                    audio_offset = 0.0
 
-                    # generate + transcribe each chunk
-                    for i, chunk_text in enumerate(chunks):
+                    for i, ch in enumerate(chunks):
+                        chunk_text = ch["text"]
+                        chunk_orig_start = int(ch["orig_start"])
+                        chunk_orig_end = int(ch["orig_end"])
+
                         status.write(f"Chunk {i+1}/{len(chunks)}: TTS → WAV")
                         wav_path = td / f"chunk_{i:04d}.wav"
                         tts_to_wav_file(chunk_text, str(wav_path), voice=voice, speed=float(speed))
@@ -520,53 +563,74 @@ if st.session_state.mode == "new":
                         dur = wav_duration_seconds(wav_path)
                         wav_paths.append(wav_path)
 
-                        status.write(f"Chunk {i+1}/{len(chunks)}: STT (timestamps)")
+                        status.write(f"Chunk {i+1}/{len(chunks)}: STT (segments)")
                         stt_verbose = whisper_segments_verbose_json(str(wav_path))
                         segs = extract_segments(stt_verbose)
 
-                        # offset timestamps into global timeline
+                        # merge for readability + better alignment anchors
+                        segs = merge_segments(segs, max_seconds=DISPLAY_SEG_MAX_SECONDS, max_chars=DISPLAY_SEG_MAX_CHARS)
+
+                        # align merged segments back to THIS chunk's original text slice
+                        align_segments_to_text(chunk_text, segs, cfg=align_cfg)
+
+                        # finalize: offset time + convert local orig spans to global orig spans
                         for s in segs:
-                            s["start"] = float(s.get("start", 0.0)) + offset
-                            s["end"] = float(s.get("end", 0.0)) + offset
+                            s["start"] = float(s.get("start", 0.0)) + audio_offset
+                            s["end"] = float(s.get("end", 0.0)) + audio_offset
+
+                            if "orig_char_start_local" in s and "orig_char_end_local" in s:
+                                local_a = int(s["orig_char_start_local"])
+                                local_b = int(s["orig_char_end_local"])
+
+                                s["orig_char_start"] = chunk_orig_start + local_a
+                                s["orig_char_end"] = chunk_orig_start + local_b
+
+                                # cleanup locals if you want
+                                del s["orig_char_start_local"]
+                                del s["orig_char_end_local"]
+
                             all_segments.append(s)
 
                         manifest["chunks"].append(
                             {
                                 "index": i,
+                                "orig_char_start": chunk_orig_start,
+                                "orig_char_end": chunk_orig_end,
                                 "chars": len(chunk_text),
                                 "duration_seconds": dur,
-                                "offset_seconds": offset,
+                                "audio_offset_seconds": audio_offset,
                             }
                         )
 
-                        offset += dur
+                        audio_offset += dur
 
                     status.write("Step 2/3: Stitching WAV chunks → master.wav")
                     master_wav = td / "master.wav"
                     stitch_wavs(wav_paths, master_wav)
 
-                    # Upload full text now (just once)
+                    # store full original extracted text (for reading view)
                     storage.write_text(full_text_key, full_text)
 
-                    status.write("Step 3/3: Converting master.wav → audio.mp3 (single encode)")
+                    status.write("Step 3/3: Convert master.wav → audio.mp3 (single encode)")
                     master_mp3 = td / "audio.mp3"
-                    audio_mime = "audio/mpeg"
+
                     audio_key = audio_mp3_key
+                    audio_mime = "audio/mpeg"
 
                     try:
                         convert_wav_to_mp3(master_wav, master_mp3, bitrate_kbps=64)
                         audio_bytes = master_mp3.read_bytes()
                         storage.write_bytes(audio_key, audio_bytes, content_type="audio/mpeg")
-                        manifest["audio"] = {"format": "mp3", "key": audio_key}
+                        manifest["audio"] = {"format": "mp3", "key": audio_key, "mime": audio_mime}
                     except Exception:
-                        # Fallback: store WAV if ffmpeg isn't available
-                        audio_bytes = master_wav.read_bytes()
+                        # fallback: store wav if ffmpeg not present
                         audio_key = audio_wav_key
                         audio_mime = "audio/wav"
+                        audio_bytes = master_wav.read_bytes()
                         storage.write_bytes(audio_key, audio_bytes, content_type="audio/wav")
-                        manifest["audio"] = {"format": "wav", "key": audio_key}
+                        manifest["audio"] = {"format": "wav", "key": audio_key, "mime": audio_mime}
 
-                # Save transcript + manifest
+                # persist aligned segments + manifest
                 storage.write_json(segments_key, all_segments)
                 storage.write_json(manifest_key, manifest)
 
@@ -612,15 +676,18 @@ else:
             item_id = selected["id"]
             item_prefix = selected.get("item_dir") or f"items/{item_id}"
 
+            full_text_key = f"{item_prefix}/full.txt"
             segments_key = f"{item_prefix}/segments.json"
             manifest_key = f"{item_prefix}/manifest.json"
+
             audio_mp3_key = f"{item_prefix}/audio.mp3"
             audio_wav_key = f"{item_prefix}/audio.wav"
 
+            full_text = storage.read_text(full_text_key) if storage.exists(full_text_key) else ""
             segments = storage.read_json(segments_key, [])
             manifest = storage.read_json(manifest_key, {})
 
-            # prefer mp3 if present
+            # prefer mp3
             if storage.exists(audio_mp3_key):
                 audio_key = audio_mp3_key
                 audio_mime = "audio/mpeg"
@@ -628,12 +695,11 @@ else:
                 audio_key = audio_wav_key
                 audio_mime = "audio/wav"
             else:
-                # last resort: check manifest
                 ak = (manifest.get("audio") or {}).get("key")
-                af = (manifest.get("audio") or {}).get("format")
+                am = (manifest.get("audio") or {}).get("mime")
                 if ak and storage.exists(ak):
                     audio_key = ak
-                    audio_mime = "audio/mpeg" if af == "mp3" else "audio/wav"
+                    audio_mime = am or "audio/mpeg"
                 else:
                     audio_key = ""
                     audio_mime = "audio/mpeg"
@@ -648,16 +714,11 @@ else:
                 f'**Created:** {selected["created_at"]}'
             )
 
-            display_segments = merge_segments(
-                segments or [],
-                max_seconds=DISPLAY_SEG_MAX_SECONDS,
-                max_chars=DISPLAY_SEG_MAX_CHARS,
-            )
-
-            st.markdown("### Transcript (tap to jump)")
-            render_audio_and_transcript(
-                mp3_or_wav_bytes=audio_bytes,
+            st.markdown("### Reading view (tap highlighted text to jump)")
+            render_audio_and_clickable_doc(
+                audio_bytes=audio_bytes,
                 mime=audio_mime,
-                segments=display_segments,
-                marker=f"{item_id}",
+                full_text=full_text,
+                segments=segments,
+                marker=item_id,
             )
